@@ -9,4 +9,4 @@ try:
     print("SAM 2 import: ok")
 except Exception as e:
     print("Import note:", e)
-print("✅ Done")
+print("Done")
