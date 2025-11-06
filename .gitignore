@@ -1,0 +1,23 @@
+# bytecode / cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# envs
+.env
+.venv
+
+# data / outputs / checkpoints
+data/
+outputs/
+checkpoints/
+*.pt
+*.pth
+
+# external repos cloned by setup.sh
+GroundingDINO/
+sam2/
+
+# conda & misc
+*.conda
+.DS_Store

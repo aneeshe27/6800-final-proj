@@ -1,0 +1,12 @@
+# Core libraries
+opencv-python
+numpy
+scipy
+scikit-learn
+networkx
+tqdm
+addict
+yacs
+pillow
+supervision
+groundingdino-py
