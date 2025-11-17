@@ -4,7 +4,11 @@ import numpy as np
 from collections import defaultdict, deque
 from typing import List, Tuple, Dict
 
-USE_SAM2 = False  # when true, you want real video masks
+# Change to script directory to avoid SAM2 import conflicts
+SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
+os.chdir(SCRIPT_DIR)
+
+USE_SAM2 = True  # when true, you want real video masks
 
 # --- CONFIG ---
 EGO4D_DIR = os.environ.get("EGO4D_DIR", str(pathlib.Path("data/ego4d").resolve()))
@@ -13,8 +17,8 @@ SEGMENTS_CSV = os.path.join(EGO4D_DIR, "segments_to_run.csv")
 OUT_DIR = "outputs/pnr_poc"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-WINDOW_SEC = 8.0       # +/- window around the PNR frame
-SAMPLE_EVERY = 0.25    # seconds between sampled frames (~4 fps)
+WINDOW_SEC = 1.0       # +/- window around the PNR frame
+SAMPLE_EVERY = 0.5    # seconds between sampled frames (~4 fps)
 IOU_THR = 0.2
 
 # prompt should be small for speed?
@@ -30,12 +34,21 @@ except Exception:
 
 GD_CFG = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GD_WTS = "GroundingDINO/weights/groundingdino_swint_ogc.pth"   
-SAM2_CFG = "sam2/configs/sam2_hiera_b+.yaml"
-SAM2_WTS = "sam2/checkpoints/sam2_hiera_base_plus.pt"         
+# SAM2 config: Hydra expects config name relative to sam2 package root (without .yaml extension)
+# There are symlinks at sam2/sam2/sam2_hiera_b+.yaml pointing to configs/sam2/sam2_hiera_b+.yaml
+# So we can use just the base name: "sam2_hiera_b+"
+SAM2_CFG = "sam2_hiera_b+"
+# SAM2 weights: use absolute path to avoid issues
+SAM2_WTS = str(pathlib.Path("sam2/checkpoints/sam2_hiera_base_plus.pt").resolve())         
 
 if not pathlib.Path(GD_WTS).exists():
     print(f"Missing the GroundingDINO weights at {GD_WTS}. Download and place them there.")
     sys.exit(1)
+
+if USE_SAM2 and not pathlib.Path(SAM2_WTS).exists():
+    print(f"Missing SAM2 weights at {SAM2_WTS}. Download and place them there.")
+    print("SAM2 will be disabled.")
+    USE_SAM2 = False
 
 gd_model = gd_load(model_config_path=GD_CFG, model_checkpoint_path=GD_WTS)
 
@@ -43,20 +56,102 @@ sam2_predictor = None
 
 if USE_SAM2:
     try:
+        # Ensure we're importing from the installed sam2 package, not the local directory
+        # Remove script directory and parent from sys.path to avoid importing local sam2 repo
+        script_dir_str = str(SCRIPT_DIR)
+        parent_dir_str = str(SCRIPT_DIR.parent)
+        
+        # Temporarily remove these from sys.path
+        removed_paths = []
+        if script_dir_str in sys.path:
+            sys.path.remove(script_dir_str)
+            removed_paths.append(script_dir_str)
+        if parent_dir_str in sys.path:
+            sys.path.remove(parent_dir_str)
+            removed_paths.append(parent_dir_str)
+        
+        # Also remove current working directory if it's in sys.path
+        cwd = os.getcwd()
+        if cwd in sys.path and cwd not in [script_dir_str, parent_dir_str]:
+            sys.path.remove(cwd)
+            removed_paths.append(cwd)
+        
         from sam2.build_sam import build_sam2_video_predictor
         import torch
         device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-        if not pathlib.Path(SAM2_WTS).exists():
-            print(f"Missing SAM2 weights at {SAM2_WTS}. Download and place them there.")
-            USE_SAM2 = False
-        else:
-            sam2_predictor = build_sam2_video_predictor(SAM2_CFG, SAM2_WTS, device=device)
+        print(f"[SAM2] building predictor on device={device}")
+        sam2_predictor = build_sam2_video_predictor(SAM2_CFG, SAM2_WTS, device=device)
+        
+        # Monkey patch to use opencv instead of decord for video loading (decord not available on macOS ARM)
+        try:
+            import decord
+        except ImportError:
+            print("[SAM2] decord not available, patching to use opencv for video loading")
+            from sam2.utils import misc
+            import torchvision.transforms.functional as F
+            
+            def load_video_frames_from_video_file_opencv(
+                video_path,
+                image_size,
+                offload_video_to_cpu,
+                img_mean=(0.485, 0.456, 0.406),
+                img_std=(0.229, 0.224, 0.225),
+                compute_device=torch.device("cuda"),
+            ):
+                """Load video frames using opencv instead of decord."""
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    raise RuntimeError(f"Cannot open video: {video_path}")
+                
+                # Get video properties
+                video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                
+                img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+                img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+                
+                images = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    # Convert BGR to RGB and resize
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float()  # HWC -> CHW
+                    frame_tensor = F.resize(frame_tensor, [image_size, image_size])
+                    images.append(frame_tensor)
+                
+                cap.release()
+                
+                if not images:
+                    raise RuntimeError(f"No frames read from video: {video_path}")
+                
+                images = torch.stack(images, dim=0) / 255.0
+                if not offload_video_to_cpu:
+                    images = images.to(compute_device)
+                    img_mean = img_mean.to(compute_device)
+                    img_std = img_std.to(compute_device)
+                
+                # Normalize by mean and std
+                images -= img_mean
+                images /= img_std
+                return images, video_height, video_width
+            
+            # Replace the function
+            misc.load_video_frames_from_video_file = load_video_frames_from_video_file_opencv
+        
+        print("[SAM2] predictor built OK")
+        
+        # Restore removed paths (optional, but cleaner)
+        for path in removed_paths:
+            if path not in sys.path:
+                sys.path.insert(0, path)
     except Exception as e:
         print("SAM2 not available; falling back to bbox masks. Error:", e)
         USE_SAM2 = False
 
 def detect_boxes(image_bgr, text_prompts: List[str], box_threshold=0.25, text_threshold=0.25):
-    # GroundingDINO expects a preprocessed
+    # GroundingDINO wantsa preprocessed torch tensor
     import torch
     from PIL import Image
     import groundingdino.datasets.transforms as T
@@ -100,27 +195,61 @@ def detect_boxes(image_bgr, text_prompts: List[str], box_threshold=0.25, text_th
     return results
 
 def segment_with_sam2(video_path: str, sampled_frames: List[int], detections_per_frame: Dict[int, List[dict]]):
-    # Use SAM2 to generate masks per frame given boxes; SAM2 has video tracking utilities.
-    # For simplicity, we run per-frame mask proposals from the boxes.
-    # (For better temporal consistency, wire SAM2's track interface; good enough for a PoC.)
+    """
+    Very small SAM-2 usage:
+    1) init video state
+    2) for each sampled frame, prompt boxes -> masks
+    NOTE: This is frame-wise prompting for speed; you can switch to true tracking later.
+    """
+    if not USE_SAM2 or sam2_predictor is None:
+        print("[SAM2] OFF -> using rectangle masks")
+        # Fallback to bbox masks when SAM2 is not available
+        masks_per_frame = {}
+        cap = cv2.VideoCapture(video_path)
+        H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cap.release()
+        
+        for fidx in sorted(sampled_frames):
+            masks = []
+            for det in detections_per_frame.get(fidx, []):
+                x1, y1, x2, y2 = [int(round(v)) for v in det["bbox"]]
+                m = np.zeros((H, W), np.uint8)
+                m[max(0, y1):min(H, y2), max(0, x1):min(W, x2)] = 1
+                masks.append({"mask": m, "label": det["label"], "bbox": [x1, y1, x2, y2]})
+            masks_per_frame[fidx] = masks
+        return masks_per_frame
+    
+    print("[SAM2] ON -> generating masks")
+    # Use real SAM2 video predictor
+    state = sam2_predictor.init_state(video_path)
     masks_per_frame = {}
-    cap = cv2.VideoCapture(video_path)
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    cap.release()
 
-    # Prepare SAM2 predictor with this video
-    # NOTE: if using full video tracking, you'd feed the whole video; here we call per-frame prompt for speed.
-    for fidx in sampled_frames:
-        masks = []
-        # sam2_predictor can take image + boxes -> masks
-        # PoC: we emulate with rectangles as masks if SAM2 call is heavy on Mac.
+    for fidx in sorted(sampled_frames):
+        # build box prompts for this frame
+        box_prompts = []
         for det in detections_per_frame.get(fidx, []):
-            x1,y1,x2,y2 = [int(round(v)) for v in det["bbox"]]
-            m = np.zeros((H,W), np.uint8)
-            m[max(0,y1):min(H,y2), max(0,x1):min(W,x2)] = 1
-            masks.append({"mask":m, "label":det["label"], "bbox":[x1,y1,x2,y2]})
-        masks_per_frame[fidx] = masks
+            x1, y1, x2, y2 = det["bbox"]
+            box_prompts.append([float(x1), float(y1), float(x2), float(y2)])
+
+        if not box_prompts:
+            masks_per_frame[fidx] = []
+            continue
+
+        # run SAM-2 on this frame with box prompts
+        pred = sam2_predictor.predict(
+            state=state,
+            frame_idx=fidx,
+            boxes=np.array(box_prompts, dtype=np.float32),
+            multimask_output=False,
+        )
+        # pred is a list of dicts with keys like 'masks', 'scores'
+        frame_masks = []
+        for k, det in enumerate(detections_per_frame.get(fidx, [])):
+            m = pred["masks"][k].astype(np.uint8)  # (H,W) in {0,1}
+            frame_masks.append({"mask": m, "label": det["label"], "bbox": det["bbox"]})
+        masks_per_frame[fidx] = frame_masks
+
     return masks_per_frame
 
 # --- Graph utilities ---
