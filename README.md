@@ -39,7 +39,7 @@ conda activate pnr-graphs
 python check_install.py
 ```
 
-If check_install.py complains about GroundingDINO or SAM-2 imports, that's fine for now—you can still run the PoC with rectangle masks. If you plan to use GroundingDINO + SAM-2, place their weights later I made a note in step 7.
+If check_install.py complains about GroundingDINO or SAM-2 imports, that's fine for now—we can still run the PoC with rectangle masks. If you plan to use GroundingDINO + SAM-2, place their weights later I made a note in step 7.
 
 ## 2) Ego4D CLI + AWS credentials
 
@@ -74,9 +74,9 @@ ego4d \
 
 This downloads the FHO JSON annotations (PRE/PNR/POST info) without videos.
 
-## 5) (Updated – Recommended) One-shot filtered download (no separate manifest step)
+## 5) One-shot filtered download (no separate manifest step)
 
-Corrected flow to avoid bulk downloads; this grabs only 10 downscaled videos that actually have PNR-annotated segments.
+No bulk downloads; this grabs only 10 downscaled videos that actually have PNR-annotated segments.
 
 ```bash
 # annotations (already done above, safe to repeat)
@@ -105,14 +105,14 @@ This produces short windows around PNR (so you don't process entire long videos)
 
 ## 7) (Optional) GroundingDINO + SAM-2 weights
 
-If you want real masks (instead of rectangle masks), place weights where demo_graph_poc.py expects.
+If we want real masks (instead of rectangle masks), place weights where demo_graph_poc.py expects.
 
 - GroundingDINO: `GroundingDINO/weights/groundingdino_swint_ogc.pth`
 - SAM-2: `sam2/checkpoints/sam2_hiera_base_plus.pt`
 
-You can still run the PoC without these; it will use rectangles from detections as masks (good enough to validate the graph-change signal).
+We can still run the PoC without these; it will use rectangles from detections as masks (good enough to validate the graph-change signal).
 
-## 8) Run the PoC (mask → graph → PCA → tiny MLP)
+## 8) Run the PoC (mask -> graph -> PCA -> tiny MLP)
 
 ```bash
 python demo_graph_poc.py
