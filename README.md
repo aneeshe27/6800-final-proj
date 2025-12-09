@@ -1,132 +1,109 @@
-# PNR Graphs Project
+# PNR Detection: Graph-Based Point of No Return Detection in Egocentric Videos
 
-## Setup
+This project implements a novel approach to **Point of No Return (PNR) detection** in egocentric videos using **Graph Neural Networks (GNNs)** and **Temporal Transformers**. PNR frames represent the critical moments in a video where the state of the world changes irreversibly due to a human action (e.g., the moment a knife cuts through a vegetable).
 
-### Quick Start
+## Overview
 
-Run the setup script to create the conda environment and install all dependencies:
+### The Problem
+In egocentric (first-person) videos, identifying the exact frame where an action causes an irreversible state change is challenging due to:
+- Complex hand-object interactions
+- Occlusions and motion blur
+- Varying action durations
+- Multiple simultaneous objects
 
-```bash
-chmod +x setup.sh
-./setup.sh
-```
+### Our Solution
+We propose a graph-based approach that:
+1. **Extracts scene graphs** from video frames using GroundingDINO + SAM2
+2. **Encodes spatial relationships** between hands and objects using GNNs
+3. **Models temporal dynamics** using Transformers
+4. **Predicts the PNR frame** through classification
 
-Then activate the environment:
+## Preparing Training Data
 
-```bash
-conda activate pnr-graphs
-```
+### Step 1: Download Ego4D Data
 
-### Notes
-
-- Add cloned git repositories (e.g., GroundingDINO/, sam2/) to .gitignore so the branch stays clean.
-- Adjust CUDA in setup.sh if you're on a different CUDA toolchain; use --cpu on Macs.
-- The script uses conda run internally, so you don't have to activate during install.
-- Repos are cloned into the project directory; keep weights outside version control.
-
-## 1) Clone + environment
+Obtain access to the Ego4D dataset at [ego4d-data.org](https://ego4d-data.org/), then download the FHO benchmark:
 
 ```bash
-# 1) get your repo
-git clone <YOUR_REPO_URL> final_proj
-cd final_proj
-
-# 2) create the conda env + install deps
-bash setup.sh --cpu    # on Mac; omit --cpu if you know your CUDA setup
-
-# 3) (optional) sanity check
-conda activate pnr-graphs
-python check_install.py
-```
-
-If check_install.py complains about GroundingDINO or SAM-2 imports, that's fine for now—we can still run the PoC with rectangle masks. If you plan to use GroundingDINO + SAM-2, place their weights later I made a note in step 7.
-
-## 2) Ego4D CLI + AWS credentials
-
-```bash
-# still in the env
 pip install ego4d awscli
+aws configure
 
-# one-time AWS credentials (use the keys Ego4D emailed you)
-aws configure --profile ego4d
-# paste Access Key, Secret; press Enter for region/output
+ego4d --output_directory="./data/ego4d" --datasets annotations --benchmarks FHO --metadata -y
+ego4d --output_directory="./data/ego4d" --datasets video_540ss --benchmarks FHO -y
 ```
 
-## 3) Set your project-local data root (quotes handle spaces)
+### Step 2: Extract PNR Frame Windows
+
+Extract frames around each PNR annotation with randomized asymmetric windows (3-10 frames before/after PNR). This prevents the model from learning positional shortcuts.
 
 ```bash
-export EGO4D_DIR="$(pwd)/data/ego4d"
-mkdir -p "$EGO4D_DIR"
+python scripts/extract_frames.py \
+    --videos-dir ./data/ego4d/v2 \
+    --output-dir ./data/pnr_frames \
+    --n-train 240 --n-val 30 --n-test 30 \
+    --frame-skip 2 --min-window 3 --max-window 10
 ```
 
-You can add that export line to your shell startup or re-run it whenever you open a new terminal here.
-
-## 4) Pull annotations (tiny)
+### Step 3: Download Model Checkpoints
 
 ```bash
-ego4d \
-  --output_directory "$EGO4D_DIR" \
-  --datasets annotations \
-  --benchmarks FHO \
-  --aws_profile_name ego4d \
-  --metadata -y
+mkdir -p checkpoints
+
+wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth \
+    -O checkpoints/groundingdino_swint_ogc.pth
+
+wget https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt \
+    -O checkpoints/sam2.1_hiera_large.pt
 ```
 
-This downloads the FHO JSON annotations (PRE/PNR/POST info) without videos.
-
-## 5) One-shot filtered download (no separate manifest step)
-
-No bulk downloads; this grabs only 10 downscaled videos that actually have PNR-annotated segments.
+### Step 4: Run Graph Induction
 
 ```bash
-# annotations (already done above, safe to repeat)
-ego4d -o "$EGO4D_DIR" --datasets annotations --benchmarks FHO --aws_profile_name ego4d --metadata -y
-
-# make 10 video_uids from annotations (script is in this repo)
-python scripts/make_10_uids_for_video540ss.py   # writes data/ego4d/v2/pnr_10_for_video_540ss.txt
-
-# download only those 10 (downscaled)
-ego4d -o "$EGO4D_DIR" --datasets video_540ss --benchmarks FHO \
-  --aws_profile_name ego4d \
-  --video_uid_file "$EGO4D_DIR/v2/pnr_10_for_video_540ss.txt" \
-  --metadata -y
+python scripts/extract_graphs.py \
+    --frames-dir ./data/pnr_frames \
+    --output-dir ./data/graphs
 ```
 
-You should see: "A total of 10 video files will be downloaded" (~6 GB total).
+This produces scene graphs with 9-dimensional node features (position, size, hand flags, semantic hash) and hand-object interaction edges.
 
-## 6) Build a small segment list (2 per video) from annotations
+## Training
 
 ```bash
-python scripts/make_segments_csv.py --per_video 2
-# -> data/ego4d/segments_to_run.csv
+python scripts/train.py \
+    --graphs-root ./data/graphs \
+    --output-dir ./outputs \
+    --epochs 100 \
+    --lr 1e-3 \
+    --batch-size 4
 ```
 
-This produces short windows around PNR (so you don't process entire long videos).
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--epochs` | 100 | Number of training epochs |
+| `--lr` | 1e-3 | Learning rate |
+| `--batch-size` | 4 | Batch size |
+| `--lambda-pnr` | 1.0 | PNR classification loss weight |
+| `--lambda-distance` | 0.1 | Distance regression loss weight |
+| `--lambda-smoothness` | 0.07 | Temporal smoothness loss weight |
 
-## 7) (Optional) GroundingDINO + SAM-2 weights
+Monitor with TensorBoard:
+```bash
+tensorboard --logdir ./runs
+```
 
-If we want real masks (instead of rectangle masks), place weights where demo_graph_poc.py expects.
-
-- GroundingDINO: `GroundingDINO/weights/groundingdino_swint_ogc.pth`
-- SAM-2: `sam2/checkpoints/sam2_hiera_base_plus.pt`
-
-We can still run the PoC without these; it will use rectangles from detections as masks (good enough to validate the graph-change signal).
-
-## 8) Run the PoC (mask -> graph -> PCA -> tiny MLP)
+## Evaluation
 
 ```bash
-python demo_graph_poc.py
+python scripts/evaluate.py \
+    --checkpoint ./outputs/best_model.pt \
+    --graphs-root ./data/graphs
 ```
 
-Outputs per segment:
+## Requirements
 
-- `outputs/pnr_poc/<video_uid>_<clip_uid>/features.csv` (per-frame graph features)
-- `outputs/pnr_poc/<video_uid>_<clip_uid>/pca.png` (trajectory; dot near PNR)
-
-Terminal: tiny-MLP metrics (correlation with distance-to-PNR; a near-PNR AUC)
-
-
-and then here are the next steps:
-
-
-
+```bash
+pip install -r requirements.txt
+pip install 'git+https://github.com/facebookresearch/segment-anything-2.git'
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+    -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
+```
